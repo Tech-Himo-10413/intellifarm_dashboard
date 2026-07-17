@@ -1,0 +1,21 @@
+[server]
+maxUploadSize = 50
+
+[theme]
+# Force the base theme to Light Mode (Fixes the dark dataframes!)
+base = "light"
+
+# Primary Accent Color (Agricultural Green for active buttons and progress bars)
+primaryColor = "#27AE60"
+
+# Main App Background (A soft off-white to reduce glare)
+backgroundColor = "#F8FBF8"
+
+# Secondary Background (Pure white for the inside of sidebar and widgets)
+secondaryBackgroundColor = "#FFFFFF"
+
+# Text Color (Dark slate gray for high contrast readability)
+textColor = "#2C3E50"
+
+# Global Font
+font = "sans serif"

@@ -1,0 +1,20 @@
+# Data Roots: Insight Studio — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Core framework
+streamlit>=1.32.0
+
+# Data handling
+polars>=0.20.0
+pandas>=2.1.0
+openpyxl>=3.1.2        # .xlsx read/write
+xlrd>=2.0.1            # .xls (legacy Excel) read
+
+# SQL engine
+duckdb>=0.10.0
+
+# Visualisation
+plotly>=5.19.0
+
+# AI / LLM
+requests>=2.31.0        # Ollama HTTP API
