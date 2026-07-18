@@ -236,10 +236,11 @@ def sanitize_columns(df: pl.DataFrame) -> pl.DataFrame:
         cleaned = re.sub(r"_+", "_", cleaned).strip("_") or "col"
 
         # ---------------------------------------------------------
-        # THE FIX: Append '_col' to make it 100% safe from SQL keywords
-        # 'group' becomes 'group_col', preventing the DuckDB crash!
+        # THE FIX: Append '_col' to make it 100% safe from SQL keywords,
+        # but ONLY if it doesn't already end in '_col' (prevents _col_col)
         # ---------------------------------------------------------
-        cleaned = f"{cleaned}_col"
+        if not cleaned.endswith("_col"):
+            cleaned = f"{cleaned}_col"
 
         # Deduplicate
         if cleaned in seen:
