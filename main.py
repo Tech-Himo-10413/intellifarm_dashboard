@@ -704,7 +704,19 @@ with tab3:
                     st.table(col_ref.set_index("Column"))
 
         with col_download:
-            st.download_button("💾 Download Data", cleaned_df.write_csv(), "cleaned_data.csv", "text/csv", width="stretch")
+            # Dynamically generate the download filename based on the original upload
+            orig_name = st.session_state.get("raw_filename", "dataset")
+            # Strip the original extension (.csv, .xlsx) and append _cleaned.csv
+            base_name = orig_name.rsplit(".", 1)[0]
+            dl_filename = f"{base_name}_cleaned.csv"
+            
+            st.download_button(
+                "💾 Download Data", 
+                cleaned_df.write_csv(), 
+                dl_filename, 
+                "text/csv", 
+                width="stretch"
+            )
 
         # ── Quick Insights: always-visible baseline charts ──
         # Permanent, regardless of whether the AI has generated a custom
