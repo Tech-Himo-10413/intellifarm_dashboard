@@ -40,11 +40,28 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────
-# CONSTANTS
+# DEPLOYMENT CONFIG (env-overridable — same code, any environment)
 # ─────────────────────────────────────────────────────────
-MAX_FILE_MB = 50
+MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "50"))
 ALLOWED_EXTENSIONS = ["csv", "xlsx", "xls"]
-DEFAULT_MODEL = "qwen2.5-coder:7b"
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "qwen2.5-coder:7b")
+
+# Where Ollama actually lives. llm_helper.py reads this same variable
+# (OLLAMA_BASE_URL) independently — kept here too only so this module can
+# tell whether it's talking to a LOCAL Ollama (safe to try auto-launching)
+# or a REMOTE one (a separate container/instance — launching is meaningless
+# there and would just silently fail every time).
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+_OLLAMA_IS_LOCAL = "localhost" in _OLLAMA_BASE_URL or "127.0.0.1" in _OLLAMA_BASE_URL
+
+# Controls whether the "Advanced (Technical) Settings" panel — model
+# switching + one-click model downloads — is shown at all. These actions
+# affect the SHARED Ollama server that every concurrent farmer's session
+# talks to, so in a real multi-user deployment you generally want only an
+# admin to have this, not every end user. Defaults to "true" so nothing
+# changes for local/single-user use; set ENABLE_MODEL_MANAGEMENT=false in
+# the farmer-facing production environment to hide it.
+ENABLE_MODEL_MANAGEMENT = os.environ.get("ENABLE_MODEL_MANAGEMENT", "true").lower() == "true"
 
 # ─────────────────────────────────────────────────────────
 # SESSION STATE DEFAULTS
@@ -198,13 +215,29 @@ def _format_kpi_value(val) -> str:
 
 def _ensure_ollama_running() -> bool:
     """
-    Checks if Ollama is reachable. If not, tries to start it in the background.
+    Checks if Ollama is reachable. Only attempts to locally launch it
+    ("ollama serve") when OLLAMA_BASE_URL points at localhost — i.e. the
+    single-machine/dev deployment shape.
+
+    In a production deployment, Ollama runs in a separate container or on a
+    separate (often GPU) instance, reachable via OLLAMA_BASE_URL. Trying to
+    `subprocess.Popen(["ollama", "serve"])` in that case is meaningless (the
+    `ollama` binary won't even be installed in the Streamlit container) and
+    would silently fail every time, masking the REAL problem — usually a
+    wrong URL or a security-group/firewall rule blocking the port — behind
+    a generic "AI assistant isn't ready" warning. So: local host → try to
+    launch it; remote host → just report reachability honestly.
+
     Returns True if Ollama is available.
     """
     try:
-        requests.get("http://localhost:11434", timeout=2)
+        requests.get(_OLLAMA_BASE_URL, timeout=2)
         return True
     except requests.ConnectionError:
+        if not _OLLAMA_IS_LOCAL:
+            # Remote Ollama unreachable — this is a network/deployment
+            # issue, not something a local subprocess launch could ever fix.
+            return False
         try:
             kwargs: dict = {
                 "stdout": subprocess.DEVNULL,
@@ -214,7 +247,7 @@ def _ensure_ollama_running() -> bool:
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             subprocess.Popen(["ollama", "serve"], **kwargs)
             time.sleep(3)
-            requests.get("http://localhost:11434", timeout=3)
+            requests.get(_OLLAMA_BASE_URL, timeout=3)
             return True
         except Exception:
             return False
@@ -255,14 +288,27 @@ if st.session_state.llm is None and ollama_alive:
 elif not ollama_alive:
     st.sidebar.warning("🌾 The AI assistant isn't running yet — dashboards can still be viewed, but 'Ask a Question' won't work right now.")
     with st.sidebar.expander("Technical details"):
-        st.caption("Ollama not found. Install from https://ollama.ai then run: `ollama run qwen2.5-coder:3b`")
+        if _OLLAMA_IS_LOCAL:
+            st.caption("Ollama not found. Install from https://ollama.ai then run: `ollama run qwen2.5-coder:3b`")
+        else:
+            st.caption(
+                f"Could not reach Ollama at {_OLLAMA_BASE_URL}. Check that OLLAMA_BASE_URL "
+                "points at the right host/port, that Ollama is running there, and that the "
+                "network/security group allows this app to reach it."
+            )
 
 # ── AI Model settings — tucked away as "Advanced", collapsed by default ──
 # Model names, memory percentages, and download progress bars are
 # meaningless (and confusing) to a farmer just trying to see their crop
 # data. This still exists for whoever manages/maintains the app, but it no
 # longer sits in plain view — it's one click away, not the first thing seen.
-if ollama_alive and st.session_state.llm is not None:
+#
+# In a shared multi-user deployment, this panel also mutates state on the
+# SHARED Ollama server (switching the active model, triggering downloads)
+# for every concurrent user at once — so it's additionally gated behind
+# ENABLE_MODEL_MANAGEMENT, which an operator can set to "false" to hide it
+# from ordinary farmer users entirely in production.
+if ollama_alive and st.session_state.llm is not None and ENABLE_MODEL_MANAGEMENT:
     with st.sidebar:
         with st.expander("⚙️ Advanced (Technical) Settings", expanded=False):
             st.markdown("### 🤖 AI Model")
@@ -285,8 +331,18 @@ if ollama_alive and st.session_state.llm is not None:
             # ── Proactive low-memory warning ──
             # Catches the "won't fit" case at page-load time instead of only
             # after the user waits through a doomed generation attempt.
+            # NOTE: this reads the RAM of the machine Streamlit is running
+            # on. When Ollama runs on a separate GPU instance (the
+            # recommended production setup), this number describes the
+            # wrong machine — it's only a meaningful signal in a
+            # single-machine/dev deployment where both run together.
             available_gb = llm_mod.get_available_memory_gb()
             needed_gb = llm_mod.estimate_model_memory_gb(selected_model)
+            if not _OLLAMA_IS_LOCAL:
+                st.caption(
+                    "ℹ️ Ollama is running on a separate machine — free-memory checks below "
+                    "reflect this web server, not the machine actually running the model."
+                )
             if available_gb is not None and needed_gb is not None:
                 if needed_gb > available_gb * 0.85:
                     st.warning(
