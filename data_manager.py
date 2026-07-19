@@ -257,8 +257,31 @@ def sanitize_columns(df: pl.DataFrame) -> pl.DataFrame:
             .replace("%", "pct")
             .replace("#", "no")
         )
+
+        # ---------------------------------------------------------
+        # CATCH-ALL: the hand-picked replacements above only cover the
+        # characters we anticipated. Real spreadsheets throw plenty of
+        # others at us — e.g. pandas names a blank header "Unnamed: 2",
+        # and that colon was slipping straight through into the SQL
+        # identifier ("unnamed:_2_col"), which DuckDB then rejects with a
+        # genuine parser error the instant the AI references that column
+        # in a query ("syntax error at or near ':'") — breaking any chart
+        # that touches it. Rather than extending the replace-list every
+        # time a new punctuation mark turns up, strip out ANYTHING that
+        # isn't a-z, 0-9, or underscore, unconditionally. This guarantees
+        # a valid SQL identifier no matter what a farmer's original column
+        # header looked like.
+        # ---------------------------------------------------------
+        cleaned = re.sub(r"[^a-z0-9_]", "_", cleaned)
+
         # Clean up multiple underscores
         cleaned = re.sub(r"_+", "_", cleaned).strip("_") or "col"
+
+        # SQL identifiers can't start with a digit unqualified (DuckDB will
+        # choke on it just like the colon case above) — e.g. a "2024_sales"
+        # header. Prefix with a letter so it's always safe unquoted.
+        if cleaned[0].isdigit():
+            cleaned = f"col_{cleaned}"
 
         # ---------------------------------------------------------
         # THE FIX: Append '_col' to make it 100% safe from SQL keywords,
