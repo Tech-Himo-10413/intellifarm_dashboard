@@ -8,6 +8,7 @@ All public functions return (result, error_string) tuples for clean caller handl
 import io
 import re
 import sys
+import threading
 import subprocess
 import importlib
 import polars as pl
@@ -44,6 +45,21 @@ _EXCEL_ENGINE_PACKAGES = {
     "xlsx": "openpyxl",
     "xls": "xlrd",
 }
+
+# Both openpyxl and xlrd are already pinned in requirements.txt, so in a
+# properly built deployment image this fallback should rarely, if ever,
+# actually fire — it exists purely as a safety net for slimmed-down or
+# hand-rolled environments that skip a full `pip install -r requirements.txt`
+# (e.g. a manually assembled container image). Kept for resilience, not
+# because it's the expected path.
+#
+# Multi-user note: ensure_package() shells out to `pip install`, which
+# mutates the SHARED Python environment every session in this process runs
+# in. Two farmers hitting "Set Up Excel Support" at the same moment would
+# otherwise race on the same pip install; this lock serializes that so the
+# second caller just waits for the first install to finish instead of both
+# corrupting each other's install.
+_pip_install_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────
@@ -186,25 +202,34 @@ def ensure_package(package_name: str) -> Tuple[bool, str]:
     needs to open a terminal or know what "pip" even is — mirrors the same
     one-click, self-healing pattern used for downloading a smaller AI model.
 
+    Thread-safety: guarded by a module-level lock, since this mutates a
+    Python environment SHARED by every concurrent user's session in this
+    process. Without the lock, two farmers clicking "Set Up Excel Support"
+    within the same window could run two pip installs simultaneously,
+    which can corrupt each other's install (partial writes to the same
+    site-packages entries). The lock just makes the second caller wait for
+    the first install to finish rather than racing it.
+
     Returns:
         (True, "") on success
         (False, error_detail) on failure
     """
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", package_name],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode == 0:
-            # Let the current process pick up the newly-installed package
-            # without needing a full app restart.
-            importlib.invalidate_caches()
-            return True, ""
-        return False, (result.stderr or result.stdout or "Unknown pip error")[-1000:]
-    except Exception as exc:
-        return False, str(exc)
+    with _pip_install_lock:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", package_name],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                # Let the current process pick up the newly-installed package
+                # without needing a full app restart.
+                importlib.invalidate_caches()
+                return True, ""
+            return False, (result.stderr or result.stdout or "Unknown pip error")[-1000:]
+        except Exception as exc:
+            return False, str(exc)
 
 
 def sanitize_columns(df: pl.DataFrame) -> pl.DataFrame:
@@ -232,14 +257,38 @@ def sanitize_columns(df: pl.DataFrame) -> pl.DataFrame:
             .replace("%", "pct")
             .replace("#", "no")
         )
+
+        # ---------------------------------------------------------
+        # CATCH-ALL: the hand-picked replacements above only cover the
+        # characters we anticipated. Real spreadsheets throw plenty of
+        # others at us — e.g. pandas names a blank header "Unnamed: 2",
+        # and that colon was slipping straight through into the SQL
+        # identifier ("unnamed:_2_col"), which DuckDB then rejects with a
+        # genuine parser error the instant the AI references that column
+        # in a query ("syntax error at or near ':'") — breaking any chart
+        # that touches it. Rather than extending the replace-list every
+        # time a new punctuation mark turns up, strip out ANYTHING that
+        # isn't a-z, 0-9, or underscore, unconditionally. This guarantees
+        # a valid SQL identifier no matter what a farmer's original column
+        # header looked like.
+        # ---------------------------------------------------------
+        cleaned = re.sub(r"[^a-z0-9_]", "_", cleaned)
+
         # Clean up multiple underscores
         cleaned = re.sub(r"_+", "_", cleaned).strip("_") or "col"
 
+        # SQL identifiers can't start with a digit unqualified (DuckDB will
+        # choke on it just like the colon case above) — e.g. a "2024_sales"
+        # header. Prefix with a letter so it's always safe unquoted.
+        if cleaned[0].isdigit():
+            cleaned = f"col_{cleaned}"
+
         # ---------------------------------------------------------
-        # THE FIX: Append '_col' to make it 100% safe from SQL keywords
-        # 'group' becomes 'group_col', preventing the DuckDB crash!
+        # THE FIX: Append '_col' to make it 100% safe from SQL keywords,
+        # but ONLY if it doesn't already end in '_col' (prevents _col_col)
         # ---------------------------------------------------------
-        cleaned = f"{cleaned}_col"
+        if not cleaned.endswith("_col"):
+            cleaned = f"{cleaned}_col"
 
         # Deduplicate
         if cleaned in seen:
@@ -356,6 +405,12 @@ def create_duckdb_connection(
 
     Using CREATE TABLE (rather than register) avoids any garbage-collection
     issues with the pandas/polars reference inside a Streamlit session.
+
+    Each Streamlit session stores its own connection in st.session_state, so
+    concurrent farmers each get an independent in-memory DuckDB instance —
+    no cross-user data ever shares a connection. The only cost to watch on a
+    shared server is aggregate memory: N concurrent sessions each hold their
+    own copy of their (cleaned) dataset in memory at once.
     """
     try:
         pandas_df = df.to_pandas()

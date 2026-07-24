@@ -5,15 +5,29 @@ Handles all interactions with the local Ollama AI engine.
 Primary role: translate natural language into SQL queries + dashboard configurations.
 """
 
+import os
 import re
 import json
 import time
 import requests
 from typing import Any, Dict, List, Optional, Tuple
 
-OLLAMA_BASE = "http://localhost:11434"
+# ─────────────────────────────────────────────────────────
+# DEPLOYMENT CONFIG (env-overridable)
+# ─────────────────────────────────────────────────────────
+# OLLAMA_BASE_URL lets this same codebase run unchanged whether Ollama is:
+#   - on the same machine as Streamlit (dev laptop)        -> default below
+#   - a sibling container on a Docker network               -> http://ollama:11434
+#   - a separate EC2/GPU instance in the same VPC            -> http://<private-ip>:11434
+# No code change needed per environment — only the env var changes.
+OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_GENERATE = f"{OLLAMA_BASE}/api/generate"
-REQUEST_TIMEOUT_SECONDS = 90
+
+# Under real concurrency a request can sit in Ollama's internal queue
+# (see OLLAMA_MAX_QUEUE / OLLAMA_NUM_PARALLEL on the server side) before
+# generation even starts. Kept env-overridable so ops can tune it without
+# a redeploy if queueing behavior changes under load.
+REQUEST_TIMEOUT_SECONDS = int(os.environ.get("OLLAMA_REQUEST_TIMEOUT_SECONDS", "150"))
 
 # Chart types the UI can render
 VALID_CHART_TYPES = {"bar", "pie", "line", "scatter", "histogram", "treemap", "funnel"}
@@ -37,7 +51,7 @@ def get_llm(model: str = "qwen2.5-coder:7b") -> Tuple[Optional[Dict], str]:
         resp.raise_for_status()
         return {"model": model, "url": OLLAMA_GENERATE}, ""
     except requests.ConnectionError:
-        return None, "Ollama is not running. Start it with: ollama serve"
+        return None, f"Ollama is not reachable at {OLLAMA_BASE}. Check OLLAMA_BASE_URL and network/security-group rules."
     except requests.Timeout:
         return None, "Ollama connection timed out."
     except Exception as exc:
@@ -62,6 +76,11 @@ def get_available_memory_gb() -> Optional[float]:
     Returns free system RAM in GB, or None if psutil isn't installed.
     This is intentionally optional/best-effort — the app works fine without
     it, it just loses the proactive low-memory warning.
+
+    NOTE: when Ollama runs on a separate machine/instance from Streamlit
+    (the recommended production setup), this reports the *Streamlit host's*
+    free RAM, not the GPU box actually running the model — it's only a
+    meaningful signal in the single-machine/dev deployment shape.
     """
     try:
         import psutil
@@ -79,6 +98,12 @@ def pull_model_stream(model_name: str):
     {"status": "pulling manifest"} or {"status": "downloading",
     "completed": 12345, "total": 987654}, so the UI can show a live progress
     bar instead of a frozen screen.
+
+    NOTE: this pulls the model onto the SHARED Ollama server — in a
+    multi-user deployment every farmer's session talks to the same Ollama
+    instance, so a pull triggered by one user affects (benefits) all of
+    them. See main.py's ENABLE_MODEL_MANAGEMENT flag, which controls
+    whether ordinary end users can trigger this at all in production.
     """
     url = f"{OLLAMA_BASE}/api/pull"
     payload = {"name": model_name, "stream": True}
@@ -155,7 +180,9 @@ def _call_ollama(
     num_ctx / num_predict are exposed (rather than hardcoded) so the resilient
     wrapper can shrink them on retry: the KV-cache buffer Ollama allocates
     scales directly with context size, so a smaller num_ctx meaningfully
-    reduces the memory footprint needed to run the model at all.
+    reduces the memory footprint needed to run the model at all — which also
+    matters more under multi-user concurrency, since every simultaneous
+    request holds its own KV cache on the shared GPU.
     """
     payload = {
         "model": llm["model"],
@@ -177,20 +204,24 @@ def _call_ollama(
         raw = resp.json().get("response", "")
         return raw, ""
     except requests.Timeout:
-        return "", f"AI timed out after {REQUEST_TIMEOUT_SECONDS}s. Try a shorter/simpler question."
+        return "", (
+            f"AI timed out after {REQUEST_TIMEOUT_SECONDS}s. This can happen under heavy "
+            "concurrent load (many farmers asking questions at once) as well as with a "
+            "long/complex question — try again, or ask something shorter/simpler."
+        )
     except requests.ConnectionError:
-        return "", "Could not connect to Ollama. Is it running? Try: ollama serve"
+        return "", f"Could not connect to Ollama at {OLLAMA_BASE}. Is it running and reachable from this server?"
     except requests.HTTPError as http_err:
         status = http_err.response.status_code if http_err.response is not None else "?"
         detail = _extract_error_body(http_err.response)
         if status == 500 and _looks_like_oom(detail):
             hint = (
-                " — your system is out of free memory to run this model at all "
+                " — the machine running Ollama is out of free memory to run this model at all "
                 "(even a small internal buffer failed to allocate). The app "
                 "automatically retries with a smaller context window to reduce "
                 "the memory needed, but if this persists: close other memory-heavy "
-                "applications, or switch to a smaller model, e.g. "
-                "`ollama pull qwen2.5-coder:3b` (or `:1.5b`) and use that instead."
+                "applications on that host, reduce OLLAMA_NUM_PARALLEL, or switch to a "
+                "smaller model, e.g. `ollama pull qwen2.5-coder:3b` (or `:1.5b`)."
             )
         elif status == 500 and _looks_like_engine_crash(detail):
             hint = (
@@ -198,16 +229,20 @@ def _call_ollama(
                 "usually triggered by grammar-constrained JSON decoding on this "
                 "model/version). The app automatically retries without that "
                 "constraint, so this should self-recover; if it keeps happening, "
-                "update Ollama to the latest version or re-pull the model with: "
-                "`ollama pull qwen2.5-coder:7b`."
+                "update Ollama to the latest version or re-pull the model."
+            )
+        elif status == 503:
+            hint = (
+                " — Ollama's request queue is full (too many concurrent questions "
+                "right now). This is expected under heavy simultaneous load; the app "
+                "will retry automatically, or try again in a few seconds."
             )
         elif status == 500:
             hint = (
                 " — this is Ollama itself failing to run the model (crash, out of "
                 "memory, or a bad/corrupted pull), not a bug in the app. "
-                "Try: `ollama run qwen2.5-coder:7b` directly in a terminal to see the "
-                "full crash log, check free RAM/VRAM, or `ollama pull qwen2.5-coder:7b` "
-                "again to redownload."
+                "Check the Ollama server logs, free RAM/VRAM on that host, or re-pull "
+                "the model."
             )
         else:
             hint = ""
