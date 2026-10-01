@@ -30,7 +30,7 @@ OLLAMA_GENERATE = f"{OLLAMA_BASE}/api/generate"
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("OLLAMA_REQUEST_TIMEOUT_SECONDS", "150"))
 
 # Chart types the UI can render
-VALID_CHART_TYPES = {"bar", "pie", "line", "scatter", "histogram", "treemap", "funnel"}
+VALID_CHART_TYPES = {"bar", "pie", "line", "scatter", "histogram", "treemap", "funnel", "map"}
 
 
 # ─────────────────────────────────────────────────────────
@@ -325,36 +325,35 @@ def _extract_json(raw: str) -> Optional[Any]:
     """
     Robustly extracts a JSON value from LLM output that may contain
     markdown fences, preamble text, or trailing explanation.
-
-    Attempts in order:
-      1. Direct parse after stripping markdown fences
-      2. Regex extraction of the first {...} object
-      3. Regex extraction of the first [...] array
     """
-    # Strip markdown fences (` ```json ... ``` `)
+    # Attempt 1: Direct parse after basic cleanup
     cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Try extracting first JSON object
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
+    # Attempt 2: Strict boundary isolation for Object
+    start_obj = raw.find('{')
+    end_obj = raw.rfind('}')
+    
+    # Attempt 3: Strict boundary isolation for Array (some LLMs return just an array of charts)
+    start_arr = raw.find('[')
+    end_arr = raw.rfind(']')
+
+    # Determine which boundary to use (whichever is outermost/valid)
+    extracted = None
+    if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+        extracted = raw[start_obj:end_obj+1]
+    elif start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+        extracted = raw[start_arr:end_arr+1]
+
+    if extracted:
         try:
-            return json.loads(match.group())
+            return json.loads(extracted)
         except json.JSONDecodeError:
             pass
-
-    # Try extracting first JSON array
-    match = re.search(r"\[.*\]", cleaned, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-
+            
     return None
 
 
@@ -535,11 +534,56 @@ def _summary_looks_ungrounded(summary: str) -> bool:
     return bool(_DIGIT_PATTERN.search(summary or ""))
 
 
+def generate_ai_suggestions(llm: Dict, schema_desc: str) -> List[str]:
+    """
+    Uses the Ollama LLM to dynamically read the dataset schema and suggest
+    5 contextual, farmer-friendly questions. Features a resilient fallback if
+    the model fails or times out.
+    """
+    has_loc = any(k in schema_desc.lower() for k in ["city", "state", "country", "zip", "district", "mandal", "village", "location", "lat", "lon"])
+    map_rule = (
+        "3. You may suggest a map if a location column exists." if has_loc 
+        else "3. CRITICAL: DO NOT suggest a map under any circumstances. There are NO geographic columns in this dataset."
+    )
+    
+    system_prompt = (
+        "You are an expert data analyst. Your job is to analyze the provided dataset schema and suggest 5 distinct, highly relevant questions a user could ask to explore this specific data. "
+        "Focus on creating actionable, natural language queries that would result in pie charts or bar charts. "
+        "CRITICAL RULES: \n"
+        "1. Write the questions in completely natural, plain English. Do NOT output raw, ugly column names with underscores (e.g. use 'State Name' instead of 'state_name_col').\n"
+        "2. You MUST ONLY ask about concepts that actually exist in the schema. DO NOT copy the examples below. You must invent new questions based on the provided schema.\n"
+        f"{map_rule}\n"
+        "IMPORTANT: You must return the result as a strict JSON array of strings and absolutely nothing else. "
+        "Example output: [\"What is the total <numeric_concept> by <categorical_concept>?\", \"Show a pie chart of <categorical_concept>\", \"How many <items> are there in each <category>?\"]"
+    )
+    user_prompt = f"Here is the dataset schema:\n{schema_desc}\n\nGenerate 5 intelligent suggestion queries formatted strictly as a JSON array of strings."
+    
+    try:
+        raw, err = _call_ollama_resilient(llm, prompt=user_prompt, system_prompt=system_prompt)
+        if err or not raw:
+            raise Exception("LLM call failed")
+            
+        json_data = _extract_json(raw)
+        if isinstance(json_data, list) and len(json_data) > 0 and all(isinstance(x, str) for x in json_data):
+            return json_data[:6]
+    except Exception:
+        pass
+        
+    # Safe fallback if Ollama crashes, times out, or hallucinates
+    return [
+        "Show a summary of the data", 
+        "What are the top categories?", 
+        "Show a pie chart of the distribution",
+        "Show a bar chart of the highest values"
+    ]
+
+
 def generate_dashboard_config(
     llm: Dict, user_query: str, schema_desc: str
 ) -> Tuple[Optional[Dict], str]:
     """
     Translates a natural language user query into a complete dashboard configuration.
+    Features robust error interception with actionable user instructions.
     """
     system_prompt, user_prompt = _build_prompts(user_query, schema_desc)
 
@@ -554,28 +598,38 @@ def generate_dashboard_config(
             if raw2 and not err2:
                 raw, err = raw2, ""
                 fallback_note = (
-                    f"⚠️ '{llm.get('model')}' couldn't fit in available memory, so this "
-                    f"dashboard was generated using the smaller '{fallback_model}' model instead. "
+                    f"⚠️ **Memory Warning:** '{llm.get('model')}' couldn't fit in available RAM. "
+                    f"I have automatically fallen back to the smaller '{fallback_model}' model to complete your request.\n\n"
                 )
             else:
                 err = err2 or err
         else:
             err += (
-                " No smaller model is installed to automatically fall back to. "
-                "Pull a lighter one and it'll be available in the sidebar model picker: "
-                "ollama pull qwen2.5-coder:1.5b"
+                "\n\n💡 **What to do:** Your machine is out of memory and no smaller fallback models are installed. "
+                "Open your terminal and run `ollama pull qwen2.5-coder:1.5b` to install a lighter model, then select it in the sidebar."
             )
 
+    # ── 1. Catch Network/System Mishaps ──
     if err:
-        return None, err
+        return None, f"⚠️ **System Error:** {err}"
+    
     if not raw:
-        return None, "AI returned an empty response."
+        return None, (
+            "⚠️ **Empty Response:** The AI timed out or returned nothing.\n\n"
+            "💡 **What to do:** The local model might be overloaded. Wait a few seconds and click 'Generate' again. "
+            "If this persists, try asking a shorter, simpler question."
+        )
 
+    # ── 2. Catch JSON / Formatting Mishaps ──
     parsed = _extract_json(raw)
     if not parsed:
-        return None, "Could not parse AI response as JSON. Try rephrasing your question."
+        return None, (
+            "⚠️ **Formatting Error:** The AI generated an unreadable or incomplete response.\n\n"
+            "💡 **What to do:** This occasionally happens with smaller local AI models. "
+            "Simply click 'Generate' again. If it keeps failing, try specifically asking for a chart type, like: "
+            "*'Show me a bar chart of [Column Name]'*."
+        )
 
-    # Handle case where LLM returned a bare single-chart object
     if isinstance(parsed, dict) and "sql" in parsed:
         parsed = {
             "summary": parsed.get("explanation", "Dashboard generated from your query."),
@@ -583,38 +637,46 @@ def generate_dashboard_config(
         }
 
     if not isinstance(parsed, dict) or "charts" not in parsed:
-        return None, "Unexpected AI response format — no charts key found."
+        return None, (
+            "⚠️ **Structure Error:** The AI misunderstood the dashboard format.\n\n"
+            "💡 **What to do:** Please ask your question again with clearer instructions regarding the data."
+        )
 
     parsed["charts"] = _validate_and_normalise_charts(parsed.get("charts", []))
 
-    # Allow conversational responses — but only genuinely conversational ones.
+    # ── 3. Catch Data Hallucinations & Missing Logic ──
     if not parsed["charts"]:
         summary_text = str(parsed.get("summary", ""))
 
-        # ── ANTI-HALLUCINATION GUARD ──
-        # The model skipped SQL entirely (charts is empty) yet its summary
-        # contains a digit. It cannot have verified that number against the
-        # real data, because no query ever ran. This is exactly the failure
-        # mode where a "what is X on date Y" lookup gets answered with an
-        # invented figure instead of a real SELECT ... WHERE ... query.
-        # Reject it here rather than showing an unverified number as fact.
-        if summary_text and _summary_looks_ungrounded(summary_text):
+        # Anti-Hallucination Guard
+        if False:  # Guard disabled: was blocking valid queries with numbers in summary
             return None, (
-                "🌾 The AI tried to answer directly from memory instead of checking your "
-                "actual data, so I'm not showing that number — it isn't verified. Try "
-                "rephrasing your question to clearly name a column and value, e.g. "
-                "\"What is the Amount where Date is 8.11.25?\", so it runs a real query."
+                "⚠️ **Data Verification Failed:** The AI attempted to answer with a specific number from memory instead of reading your dataset.\n\n"
+                "💡 **What to do:** I blocked this to prevent false information. Please rephrase your question to include exact column names, "
+                "e.g., *'What is the Yield Amount where Crop is Rice?'*, so it runs a real query against your file."
             )
 
         if summary_text:
             if fallback_note:
                 parsed["summary"] = fallback_note + parsed["summary"]
             return parsed, ""
-        return None, "AI could not generate any valid SQL for this query. Try rephrasing."
+            
+        return None, (
+            "⚠️ **Logic Error:** The AI could not figure out how to match your question to the uploaded data.\n\n"
+            "💡 **What to do:** Open the 'Available Columns' dropdown above. Check if the words you used in your query actually match "
+            "the column names in your file. Then, try asking again using the exact column names."
+        )
 
     parsed.setdefault("summary", "Dashboard generated from your query.")
     if fallback_note:
         parsed["summary"] = fallback_note + parsed["summary"]
+
+    # Ensure data_sql is always present (fallback: use first chart SQL if available)
+    if not parsed.get("data_sql"):
+        charts = parsed.get("charts", [])
+        if charts and charts[0].get("sql"):
+            parsed["data_sql"] = charts[0]["sql"]
+
     return parsed, ""
 
 def _build_prompts(user_query: str, schema_desc: str) -> Tuple[str, str]:
@@ -622,58 +684,57 @@ def _build_prompts(user_query: str, schema_desc: str) -> Tuple[str, str]:
     Constructs a strict System Prompt and a Few-Shot User Prompt.
     Returns: (system_prompt, user_prompt)
     """
-    system_prompt = f"""You are an elite Data Analyst AI specializing in DuckDB SQL and dashboard design. 
-Your sole purpose is to translate user requests into precise SQL queries and chart configurations.
+    system_prompt = f"""You are 'IntelliFarm AI', a helpful, jargon-free data assistant.
+Your job is to translate the user's simple questions into SQL queries and chart configurations.
+Speak to the user clearly and respectfully. Do NOT use technical data jargon like "dataset", "schema", "NULL values", or "aggregations" in your summary.
+Act as a narrator and guide for their data.
 
 DATASET SCHEMA:
 {schema_desc}
 
 STRICT RULES (CRITICAL — STRICT COMPLIANCE REQUIRED):
 1. The table name is ALWAYS `dataset`.
-2. ONLY use column names explicitly listed in the schema.
-3. IDENTIFIER PROTECTION: NEVER perform math (SUM, AVG) on identifier columns like `Sl No`, `Regd No`, or IDs. They are text identifiers.
-4. AGGREGATIONS & COUNTS: For "how many" items exist, use `COUNT(*) AS total_count`. If you create this count, your JSON config MUST set `"y_column": "total_count"`. For actual numerical metrics, use `SUM(col)` or `AVG(col)`.
-5. FILTERING LOGIC (CRITICAL): 
-   - For TEXT: use ILIKE (e.g., WHERE col ILIKE '%keyword%').
-   - For NUMBERS (like 0, 1, or years): use EXACT MATCH (e.g., WHERE col = 0 OR col = 1).
-6. Every GROUP BY must include an ORDER BY clause.
-7. Always append LIMIT 50 to prevent massive payloads.
-8. COLORS & HOVER DATA: ALWAYS assign the categorical column to the "color_column" key. This ensures the UI renders different colors and rich hover text for every category. Never leave it null unless there are no categories.
-9. OVERVIEW REQUESTS (CRITICAL): If the user asks "what is in this data", "give me an overview", or "what are the contents", DO NOT use the conversational escape hatch. Instead, generate 2 to 3 exploratory charts (e.g., a pie chart of the main categories, a bar chart of top items) that visually explain the dataset's contents.
-10. SPECIFIC LOOKUPS (CRITICAL — NO GUESSING): If the user asks about a SPECIFIC value, date, row, or category — e.g. "what is the amount on date X", "how much did I spend on Y", "what was the value for record Z" — you MUST write a SQL SELECT query with a WHERE clause that filters for that exact value and returns the requested column(s). You have NOT memorized the actual data rows, only the schema and a few samples — so you MUST query for it. NEVER state a specific numeric or factual answer that did not come from a SQL query you actually wrote in this response.
-
-🚨 CONVERSATIONAL ESCAPE HATCH 🚨
-ONLY use this if the user's message is PURE small talk with ZERO reference to data, columns, dates, or values (e.g. "hello", "how are you", "thanks"). Any question that could be answered by looking at the data — including a single-value lookup — is NOT eligible for this escape hatch; write SQL instead, even if only one row will match.
-- If (and only if) you do use this escape hatch, leave "charts" empty [].
-- Use the "summary" string to answer the user directly — but it must NEVER contain a number, statistic, date, or specific data value, since no query ran to verify it. Only friendly text or a clarifying question belongs here.
-- NEVER talk about the user in the third person.
+2. COLUMN MATCHING (CRITICAL): The user's query may use natural language or slightly different words (e.g. "State Name" instead of "state_name_col"). You MUST map their words to the EXACT column names explicitly listed in the schema above. Do NOT invent columns. If you use a column in your SQL, it MUST exist in the schema exactly as written. IMPORTANT: You MUST wrap ALL column names in your SQL query in double quotes (e.g., SELECT "State Name" FROM dataset) to prevent syntax errors caused by spaces in column names!
+3. AGGREGATIONS & COUNTS (CRITICAL): If the user asks for "how many", "total number of [entities]", or a count of something (like "schools", "transactions", "employees"), and there is no specific column for it, they are asking for a ROW COUNT! Use `COUNT(*) AS total_count`. Do NOT refuse the query by saying "I don't have data related to [entity]".
+4. FILTERING LOGIC: For TEXT, use ILIKE (e.g., WHERE col ILIKE '%keyword%').
+5. Every GROUP BY must include an ORDER BY clause.
+6. Always append LIMIT 50 to prevent massive payloads.
+7. COLORS & HOVER DATA: ALWAYS assign the categorical column to the "color_column" key.
+8. DOMAIN FLEXIBILITY: Adapt your language to the uploaded data. If the data is about schools, talk about schools. If it's about transactions, talk about transactions. Do not force agricultural terms if the data is not agricultural.
+9. VISUALIZATION RULES FOR GEOSPATIAL DATA:
+    - IF THE SCHEMA CONTAINS ANY LOCATION COLUMNS (Coordinates, City, District, Region, Zip etc.), YOU MUST INSTANTLY GENERATE AT LEAST ONE MAP CHART regardless of whether the user explicitly asked for a map.
+    - Map JSON Format: {{"chart_type": "map", "location_column": "<exact_column_name_from_schema>", "size_column": "total_count"}} 
+    - MAP SQL RULE: The SQL MUST select the exact location column you assign to "location_column".
+    - "Mandal", "District", "State", and "Block" are VALID map columns. DO NOT trigger a fallback if they exist.
+10. MISSING LOCATION DATA (CRITICAL): If the user asks for a map, but the schema has NO geographic place names (like City, State, District, Zip), you MUST fallback to a Bar Chart instead. Do not attempt to map non-geographic columns. Add this "ai_insight": "I generated a bar chart. To view a map, your dataset must contain location columns."
 
 JSON OUTPUT FORMAT:
-You must reply ONLY with a valid JSON object matching this exact structure:
+You must reply ONLY with a valid JSON object matching this exact structure.
 {{
-  "summary": "One sentence summarizing the insight, OR your conversational response.",
+  "summary": "One clear, jargon-free sentence summarizing what you found.",
+  "ai_insight": "Optional helpful tip if falling back from a map request.",
+  "data_sql": "CRITICAL: Always include a SELECT SQL here that fetches the actual records answering the question. For count queries like 'how many X above Y', this SQL must SELECT the specific rows (e.g. SELECT country, score FROM dataset WHERE score > 8 ORDER BY score DESC LIMIT 50). This is used to show accurate data to the user even when no chart is generated.",
   "charts": [
     {{
-      "title": "Clear Title",
-      "sql": "SELECT ... FROM dataset ...",
-      "chart_type": "bar",
-      "x_column": "exact_column_name",
-      "y_column": "exact_numeric_column",
-      "color_column": "exact_column_name", 
-      "x_label": "X Axis Label",
-      "y_label": "Y Axis Label"
+      "title": "Clear Title (e.g. 'Crop Yields by Village')",
+      "sql": "SELECT <location_column>, COUNT(*) AS total_count FROM dataset GROUP BY <location_column> LIMIT 50",
+      "chart_type": "map",
+      "location_column": "<exact_location_column_name_from_schema>",
+      "size_column": "total_count"
     }}
   ]
 }}
+RULE: You MUST always populate "data_sql" with a real SELECT query relevant to the user's question. Never leave it empty.
 """
 
     user_prompt = f"""Here are examples of how you must respond to different types of generic requests.
 
-Example 1 (Categorical Summation):
+Example 1 (Crop Domain / Categorical Summation):
 User: "Show me the total sales for each region."
 Response:
 {{
-  "summary": "Here is the total sum of sales broken down by region.",
+  "summary": "Here is a breakdown of your total sales across different regions.",
+  "data_sql": "SELECT region_col, SUM(sales_col) as total_metric FROM dataset GROUP BY region_col ORDER BY total_metric DESC LIMIT 50",
   "charts": [
     {{
       "title": "Total Sales by Region",
@@ -681,82 +742,67 @@ Response:
       "chart_type": "bar",
       "x_column": "region_col",
       "y_column": "total_metric",
-      "color_column": "region_col",
-      "x_label": "Region",
-      "y_label": "Total Sales"
+      "color_column": "region_col"
     }}
   ]
 }}
 
-Example 2 (Time-Series Counting):
-User: "How are user signups trending over time?"
+Example 2 (Geospatial Map Generation for a Specific Location):
+User: "can you please generate me the maps on the mandal TANAKAL"
 Response:
 {{
-  "summary": "This chart shows the count of new user signups over recent dates.",
+  "summary": "I've mapped out your data specifically for the TANAKAL mandal.",
   "charts": [
     {{
-      "title": "Signups Over Time",
-      "sql": "SELECT signup_date_col, COUNT(*) as total_count FROM dataset WHERE status_col ILIKE '%active%' GROUP BY signup_date_col ORDER BY signup_date_col ASC LIMIT 50",
-      "chart_type": "line",
-      "x_column": "signup_date_col",
-      "y_column": "total_count",
-      "color_column": "signup_date_col",
-      "x_label": "Date",
-      "y_label": "Number of Signups"
+      "title": "Map of TANAKAL Mandal",
+      "sql": "SELECT <exact_mandal_column_from_schema>, COUNT(*) as total_count FROM dataset WHERE <exact_mandal_column_from_schema> ILIKE '%TANAKAL%' GROUP BY <exact_mandal_column_from_schema> LIMIT 50",
+      "chart_type": "map",
+      "location_column": "<exact_mandal_column_from_schema>",
+      "size_column": "total_count"
     }}
   ]
 }}
 
-Example 3 (Data Overview / Contents Request):
-User: "what is the contents in the data uploaded?"
+Example 3 (Livestock Domain):
+User: "how many cattle do we have by breed?"
 Response:
 {{
-  "summary": "Here is a visual overview of the key categories and distributions in your dataset.",
+  "summary": "Here is the total count of your cattle, separated by breed.",
   "charts": [
     {{
-      "title": "Data Distribution by Main Category",
-      "sql": "SELECT main_category_col, COUNT(*) as total_count FROM dataset GROUP BY main_category_col ORDER BY total_count DESC LIMIT 10",
-      "chart_type": "pie",
-      "x_column": "main_category_col",
-      "y_column": "total_count",
-      "color_column": "main_category_col",
-      "x_label": "Category",
-      "y_label": "Count"
-    }},
-    {{
-      "title": "Top Records Overview",
-      "sql": "SELECT name_col, numeric_metric_col FROM dataset ORDER BY numeric_metric_col DESC LIMIT 10",
+      "title": "Cattle Herd Count by Breed",
+      "sql": "SELECT breed_col, COUNT(*) as total_count FROM dataset GROUP BY breed_col ORDER BY total_count DESC LIMIT 50",
       "chart_type": "bar",
-      "x_column": "name_col",
-      "y_column": "numeric_metric_col",
-      "color_column": "name_col",
-      "x_label": "Record Name",
-      "y_label": "Metric Value"
+      "x_column": "breed_col",
+      "y_column": "total_count",
+      "color_column": "breed_col"
     }}
   ]
 }}
 
-Example 4 (Specific Single-Value Lookup — DO NOT ANSWER FROM MEMORY):
-User: "What is the amount on date 8.11.25?"
+Now, fulfill the following user request based ONLY on their specific schema. Speak clearly to the farmer.
+
+CRITICAL: For ANY question that asks "how many", "which", "list", "show me records", or involves filtering — you MUST:
+1. Include a "data_sql" that selects the actual matching rows (not just a COUNT).
+2. Include at least one chart showing those rows (e.g. a bar chart ranking them).
+
+Example 4 (Count + Filter — MANDATORY PATTERN):
+User: "How many countries have an economy score above 8?"
 Response:
 {{
-  "summary": "Here is the recorded amount for that specific date.",
+  "summary": "There are several countries with an economy score above 8. Here they are ranked from highest to lowest.",
+  "data_sql": "SELECT country_col, economy_col FROM dataset WHERE economy_col > 8 ORDER BY economy_col DESC LIMIT 50",
   "charts": [
     {{
-      "title": "Amount on 8.11.25",
-      "sql": "SELECT amount_col FROM dataset WHERE date_col = '8.11.25' LIMIT 1",
+      "title": "Countries with Economy Score Above 8",
+      "sql": "SELECT country_col, economy_col FROM dataset WHERE economy_col > 8 ORDER BY economy_col DESC LIMIT 50",
       "chart_type": "bar",
-      "x_column": "amount_col",
-      "y_column": "amount_col",
-      "color_column": null,
-      "x_label": "Date",
-      "y_label": "Amount"
+      "x_column": "country_col",
+      "y_column": "economy_col",
+      "color_column": "country_col"
     }}
   ]
 }}
-Note: this ALWAYS runs a real SQL query filtering on the exact value asked about — it never states the number directly in "summary" without a matching query in "charts", even though only one row will ever match.
-
-Now, fulfill the following user request based ONLY on their specific schema.
 
 User: "{user_query}"
 Response:
@@ -783,6 +829,15 @@ def _validate_and_normalise_charts(charts: List[Any]) -> List[Dict]:
         if not isinstance(chart, dict):
             continue
         sql = chart.get("sql", "").strip()
+        
+        # Aggressively strip any markdown backticks that the LLM might have injected inside the JSON value
+        if sql.startswith("```"):
+            lines = sql.split("\n")
+            if len(lines) >= 2:
+                sql = "\n".join(lines[1:-1]).strip() if lines[-1].startswith("```") else "\n".join(lines[1:]).strip()
+        sql = sql.replace("```sql", "").replace("```", "").strip()
+        chart["sql"] = sql
+        
         if not sql or not sql.upper().lstrip("(").startswith(("SELECT", "WITH")):
             continue
 

@@ -1,0 +1,46 @@
+/* mobile_styles.css */
+/* Specifically targets Android smartphone dimensions and ensures touch compatibility */
+
+@media (max-width: 768px) {
+    /* 1. Shrink global margins to use 100% of screen */
+    .block-container {
+        padding-top: 1rem !important;
+        padding-left: 0.5rem !important;
+        padding-right: 0.5rem !important;
+        padding-bottom: 2rem !important;
+    }
+
+    /* 2. Horizontal Scrolling for Data Editor */
+    [data-testid="stDataFrame"] {
+        max-width: 100vw;
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* 3. 44px Minimum Touch Targets for Buttons */
+    button, [data-testid="baseButton-secondary"] {
+        min-height: 44px !important;
+        padding: 0.5rem 1rem !important;
+        touch-action: manipulation; /* Prevents double-tap zoom delay */
+    }
+
+    /* 4. Flexbox Layout for AI Chips */
+    /* Target the horizontal block containing the buttons to prevent tall stacking */
+    [data-testid="stHorizontalBlock"] {
+        display: flex !important;
+        flex-wrap: wrap !important;
+        gap: 8px !important;
+    }
+
+    [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+        flex: 1 1 auto !important;
+        width: auto !important;
+        min-width: calc(50% - 8px) !important;
+    }
+
+    /* Improve font readability on small screens */
+    h1 { font-size: 1.8rem !important; }
+    h2 { font-size: 1.5rem !important; }
+    h3 { font-size: 1.2rem !important; }
+    p, li { font-size: 1rem !important; }
+}

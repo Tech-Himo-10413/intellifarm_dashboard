@@ -1,0 +1,27 @@
+# Git
+.git
+.gitignore
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Presentations & docs
+*.pptx
+
+# Data caches
+geocache.json
+
+# Streamlit secrets
+.streamlit/secrets.toml

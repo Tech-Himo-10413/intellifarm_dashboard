@@ -7,10 +7,6 @@ All public functions return (result, error_string) tuples for clean caller handl
 
 import io
 import re
-import sys
-import threading
-import subprocess
-import importlib
 import polars as pl
 import pandas as pd
 import duckdb
@@ -46,20 +42,50 @@ _EXCEL_ENGINE_PACKAGES = {
     "xls": "xlrd",
 }
 
-# Both openpyxl and xlrd are already pinned in requirements.txt, so in a
-# properly built deployment image this fallback should rarely, if ever,
-# actually fire — it exists purely as a safety net for slimmed-down or
-# hand-rolled environments that skip a full `pip install -r requirements.txt`
-# (e.g. a manually assembled container image). Kept for resilience, not
-# because it's the expected path.
-#
-# Multi-user note: ensure_package() shells out to `pip install`, which
-# mutates the SHARED Python environment every session in this process runs
-# in. Two farmers hitting "Set Up Excel Support" at the same moment would
-# otherwise race on the same pip install; this lock serializes that so the
-# second caller just waits for the first install to finish instead of both
-# corrupting each other's install.
-_pip_install_lock = threading.Lock()
+# ─────────────────────────────────────────────────────────
+# CELL-LEVEL TYPE-MISMATCH DETECTION (From UI Layer)
+# ─────────────────────────────────────────────────────────
+
+def find_bad_cells(pdf: pd.DataFrame, mismatch_cols: list) -> pd.DataFrame:
+    rows = []
+    for col in mismatch_cols:
+        if col not in pdf.columns:
+            continue
+        for idx, val in pdf[col].items():
+            if pd.isna(val):
+                continue
+            s = str(val).strip()
+            if s == "":
+                continue
+            try:
+                float(s)
+            except (TypeError, ValueError):
+                rows.append({"Row #": idx, "Column": col, "Value": val})
+    return pd.DataFrame(rows)
+
+FLAG_PREFIX = "🚩 "
+
+def mark_bad_cells(pdf: pd.DataFrame, bad_cells_df: pd.DataFrame) -> pd.DataFrame:
+    marked = pdf.copy()
+    if bad_cells_df.empty:
+        return marked
+    for _, row in bad_cells_df.iterrows():
+        r, c = row["Row #"], row["Column"]
+        if r in marked.index and c in marked.columns:
+            marked.at[r, c] = f"{FLAG_PREFIX}{marked.at[r, c]}"
+    return marked
+
+def strip_flag_prefix(pdf: pd.DataFrame, cols: list) -> pd.DataFrame:
+    cleaned = pdf.copy()
+    for c in cols:
+        if c in cleaned.columns:
+            cleaned[c] = cleaned[c].apply(
+                lambda v: v[len(FLAG_PREFIX):] if isinstance(v, str) and v.startswith(FLAG_PREFIX) else v
+            )
+    return cleaned
+
+def safe_for_display(pdf: pd.DataFrame) -> pd.DataFrame:
+    return pdf.astype(str).fillna("—")
 
 
 # ─────────────────────────────────────────────────────────
@@ -195,41 +221,23 @@ def preview_raw_rows(file_bytes: bytes, filename: str, n_rows: int = 8) -> Tuple
         return None, f"Preview error: {exc}"
 
 
-def ensure_package(package_name: str) -> Tuple[bool, str]:
+def clean_dataset(edited_pd: pd.DataFrame, auto_cast: bool, auto_fill: bool, drop_dups: bool, report: dict) -> pl.DataFrame:
     """
-    Installs a missing optional dependency (e.g. openpyxl for .xlsx support)
-    directly from within the running app, so a non-technical user never
-    needs to open a terminal or know what "pip" even is — mirrors the same
-    one-click, self-healing pattern used for downloading a smaller AI model.
-
-    Thread-safety: guarded by a module-level lock, since this mutates a
-    Python environment SHARED by every concurrent user's session in this
-    process. Without the lock, two farmers clicking "Set Up Excel Support"
-    within the same window could run two pip installs simultaneously,
-    which can corrupt each other's install (partial writes to the same
-    site-packages entries). The lock just makes the second caller wait for
-    the first install to finish rather than racing it.
-
-    Returns:
-        (True, "") on success
-        (False, error_detail) on failure
+    Cleans the dataset after UI editing.
     """
-    with _pip_install_lock:
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", package_name],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if result.returncode == 0:
-                # Let the current process pick up the newly-installed package
-                # without needing a full app restart.
-                importlib.invalidate_caches()
-                return True, ""
-            return False, (result.stderr or result.stdout or "Unknown pip error")[-1000:]
-        except Exception as exc:
-            return False, str(exc)
+    final_df = pl.from_pandas(edited_pd)
+
+    if auto_cast and report.get("type_mismatches"):
+        for tm in report.get("type_mismatches", []):
+            final_df = final_df.with_columns(pl.col(tm["column"]).cast(pl.Float64, strict=False))
+
+    if auto_fill:
+        final_df = auto_fill_missing(final_df)
+
+    if drop_dups:
+        final_df = final_df.unique(maintain_order=True)
+
+    return final_df
 
 
 def sanitize_columns(df: pl.DataFrame) -> pl.DataFrame:
@@ -386,11 +394,20 @@ def generate_health_report(df: pl.DataFrame) -> Dict[str, Any]:
 
 def auto_fill_missing(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Automatically fills empty/null values with 0.
+    Automatically fills empty/null values with type-appropriate defaults.
+    Numeric columns get 0, string columns get empty string "".
     Only triggered if the user checks the auto-fill box in the UI.
     """
-    # Safely fills nulls with 0 without overwriting manual string/numeric edits
-    return df.fill_null(0).fill_nan(0)
+    fills = []
+    for col_name in df.columns:
+        dtype = df[col_name].dtype
+        if dtype in (pl.Float32, pl.Float64):
+            fills.append(pl.col(col_name).fill_null(0).fill_nan(0))
+        elif dtype.is_numeric():
+            fills.append(pl.col(col_name).fill_null(0))
+        else:
+            fills.append(pl.col(col_name).fill_null(""))
+    return df.with_columns(fills) if fills else df
 
 # ─────────────────────────────────────────────────────────
 # 4. DUCKDB LAYER
@@ -413,10 +430,10 @@ def create_duckdb_connection(
     own copy of their (cleaned) dataset in memory at once.
     """
     try:
-        pandas_df = df.to_pandas()
-        conn = duckdb.connect(":memory:")
+        arrow_table = df.to_arrow()
+        conn = duckdb.connect(":memory:", config={"enable_external_access": "false"})
         # Register as a temporary view, then bake into a real table
-        conn.register("_staging", pandas_df)
+        conn.register("_staging", arrow_table)
         conn.execute("CREATE TABLE dataset AS SELECT * FROM _staging")
         conn.unregister("_staging")
         return conn, ""
@@ -470,19 +487,31 @@ def get_schema_description(df: pl.DataFrame) -> str:
     """
     Builds a rich, LLM-friendly schema description with:
     - Exact column names (as stored in the `dataset` table)
-    - Data types
-    - Unique value counts
-    - Sample values for categorical columns (≤ 30 unique)
-    - Min / max for numeric columns
-    - Separate sections for grouping vs. metric columns
+    - Data types, unique counts, and samples
+    - NEW: Dedicated grouping for Location & Geospatial data (Coordinates, Cities, Land IDs)
     """
     grouping_cols: List[str] = []
     metric_cols: List[str] = []
     id_cols: List[str] = []
+    location_cols: List[str] = []
+
+    # 1. Keywords to automatically detect geographic columns
+    location_keywords = [
+        "lat", "lon", "city", "village", "district", "state", "location", 
+        "address", "pin", "mandal", "tehsil", "taluka", "region", "place",
+        "patta", "khata", "plot", "mouza", "panchayat", "block", "zip"
+    ]
 
     for col in df.columns:
         n_unique = df[col].n_unique()
         dtype = df[col].dtype
+        col_lower = col.lower()
+        
+        # 2. Check if it's a location column first
+        if any(kw in col_lower for kw in location_keywords):
+            location_cols.append(col)
+            continue # Skip adding to other groups so it stands out to the LLM
+
         if dtype in NUMERIC_DTYPES:
             if n_unique >= df.height * 0.9:
                 id_cols.append(col)
@@ -498,6 +527,20 @@ def get_schema_description(df: pl.DataFrame) -> str:
         f"  TOTAL COLS : {df.width}",
         "",
     ]
+    
+    # 3. Inject the dedicated Location section for the map prompt
+    if location_cols:
+        lines.append("── LOCATION & GEOSPATIAL COLUMNS (Use for MAP generation) ──")
+        for col in location_cols:
+            dtype_str = str(df[col].dtype)
+            if df[col].dtype in NUMERIC_DTYPES:
+                col_min, col_max = df[col].min(), df[col].max()
+                lines.append(f"  • {col}  ({dtype_str}, range: {col_min} → {col_max})")
+            else:
+                n_unique = df[col].n_unique()
+                samples = _get_samples(df, col)
+                lines.append(f"  • {col}  ({dtype_str}, {n_unique} unique){samples}")
+        lines.append("")
 
     if grouping_cols:
         lines.append("── GROUPING / CATEGORICAL COLUMNS (use in GROUP BY, WHERE, ILIKE) ──")

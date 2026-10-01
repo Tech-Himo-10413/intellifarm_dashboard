@@ -1,5 +1,6 @@
 # Environments
 venv/
+.venv/
 env/
 .env
 
@@ -11,3 +12,21 @@ __pycache__/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Data caches & databases
+geocache.json
+*.duckdb
+*.db
+
+# Uploaded test data
+*.csv
+*.xlsx
+*.xls

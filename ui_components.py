@@ -3,7 +3,7 @@ ui_components.py
 ================
 Handles visual styling and dynamic Plotly dashboard generation.
 
-Supported chart types: bar, pie, line, scatter, histogram, treemap, funnel.
+Supported chart types: bar, pie, line, scatter, histogram, treemap, funnel, map.
 All builders fall back gracefully if columns are missing or data is sparse.
 """
 import contextlib
@@ -11,30 +11,87 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+import json
+import os
+import contextlib
+
+
+
+def scroll_to_top():
+    import time
+    ts = int(time.time() * 1000)
+    st.components.v1.html(
+        f"""
+        <script>
+        // TS: {ts}
+        setTimeout(function() {{
+            const el = window.parent.document.getElementById('top_of_page') || document.getElementById('top_of_page');
+            if (el) {{
+                el.scrollIntoView({{behavior: 'smooth', block: 'start'}});
+            }} else {{
+                const targets = [
+                    window.parent.document.querySelector('[data-testid="stAppViewContainer"]'),
+                    window.parent.document.querySelector('.main'),
+                    window.parent.document.documentElement,
+                    window.parent.document.body,
+                    document.querySelector('[data-testid="stAppViewContainer"]'),
+                    document.documentElement
+                ];
+                targets.forEach(t => {{ if (t) {{ t.scrollTo({{top: 0, behavior: 'smooth'}}); }} }});
+            }}
+        }}, 150);
+        </script>
+        """, height=0
+    )
+
+def scroll_down_slightly():
+    import time
+    ts = int(time.time() * 1000)
+    st.components.v1.html(
+        f"""
+        <script>
+        // TS: {ts}
+        setTimeout(function() {{
+            const targets = [
+                window.parent.document.querySelector('[data-testid="stAppViewContainer"]'),
+                window.parent.document.querySelector('.main'),
+                window.parent.document.documentElement,
+                window.parent.document.body,
+                document.querySelector('[data-testid="stAppViewContainer"]'),
+                document.documentElement
+            ];
+            targets.forEach(t => {{ if (t) {{ t.scrollBy({{top: 400, behavior: 'smooth'}}); }} }});
+        }}, 150);
+        </script>
+        """, height=0
+    )
 
 # ─────────────────────────────────────────────────────────
 # DESIGN TOKENS
 # ─────────────────────────────────────────────────────────
 BRAND_BLUE = "#1F618D"
 PALETTE = [
-    "#1F618D", "#2ECC71", "#E74C3C", "#F39C12", "#9B59B6",
-    "#1ABC9C", "#E67E22", "#3498DB", "#E91E63", "#00BCD4",
+    "#27AE60", "#2E86C1", "#1ABC9C", "#2980B9", "#117A65",
+    "#1ABC9C", "#3498DB", "#16A085", "#2471A3", "#52BE80"
 ]
 FONT_FAMILY = "Inter, Segoe UI, Arial, sans-serif"
 
 
 # ─────────────────────────────────────────────────────────
-# 1. GLOBAL CSS
+# 1. GLOBAL CSS & GEOCODING
 # ─────────────────────────────────────────────────────────
 
 def apply_custom_css() -> None:
-    """Injects dynamic CSS that automatically respects Streamlit's Light/Dark themes."""
+    """Injects dynamic CSS that automatically respects Streamlit's native Light/Dark themes."""
     st.markdown(
         """
         <style>
         /* Hide Streamlit chrome but keep the menu for theme switching */
         #MainMenu, footer { visibility: hidden; }
+
 
         /* Comfortable main content padding */
         .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
@@ -103,18 +160,70 @@ def apply_custom_css() -> None:
         """,
         unsafe_allow_html=True,
     )
+    
+@st.cache_data(show_spinner=False)
+def geocode_locations(locations_list: list, suffix: str = ", India") -> tuple:
+    """Translates text names like 'Machamara' into exact coordinates using OpenStreetMap and a persistent cache."""
+    cache_file = "geocache.json"
+    coords_map = {}
+    
+    # Load cache
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                coords_map = json.load(f)
+        except Exception:
+            pass
+
+    geolocator = Nominatim(user_agent="intellifarm_dashboard_agent")
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1) 
+    
+    failed_locs = []
+    new_geocodes = False
+    
+    for loc in locations_list:
+        if pd.isna(loc) or not str(loc).strip(): 
+            continue
+            
+        loc_str = str(loc).strip()
+        query = f"{loc_str}{suffix}" 
+        
+        # Check cache first
+        if loc_str in coords_map:
+            continue
+            
+        try:
+            location_data = geocode(query)
+            if location_data:
+                coords_map[loc_str] = (location_data.latitude, location_data.longitude)
+                new_geocodes = True
+            else:
+                failed_locs.append(loc_str)
+        except Exception:
+            failed_locs.append(loc_str)
+            
+    # Save cache if updated
+    if new_geocodes:
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(coords_map, f)
+        except Exception:
+            pass
+            
+    return coords_map, failed_locs
 
 
 # ─────────────────────────────────────────────────────────
 # 2. MAIN CHART DISPATCHER
 # ─────────────────────────────────────────────────────────
 
-def build_chart(df: pd.DataFrame, cfg: Dict) -> Optional[go.Figure]:
+def build_chart(df: pd.DataFrame, cfg: Dict) -> Tuple[Optional[go.Figure], Optional[str], Optional[str]]:
     """
     Builds the best-fitting Plotly chart for the given data and config.
+    Returns (figure, error_message, warning_message).
     """
     if df is None or df.empty or df.columns.empty:
-        return None
+        return None, "Data is empty.", None
 
     cols = df.columns.tolist()
     title = cfg.get("title", "Data Insight")
@@ -124,9 +233,6 @@ def build_chart(df: pd.DataFrame, cfg: Dict) -> Optional[go.Figure]:
     x_col = _resolve_col(df, cfg.get("x_column"), cols, 0)
     y_col = _resolve_col(df, cfg.get("y_column"), cols, 1)
     color_col = cfg.get("color_column") if cfg.get("color_column") in cols else None
-
-    if x_col is None:
-        return None  # Truly cannot determine any column
 
     # 🟢 Guarantee colors for bar charts to make them visually attractive!
     if chart_type == "bar" and not color_col:
@@ -144,14 +250,21 @@ def build_chart(df: pd.DataFrame, cfg: Dict) -> Optional[go.Figure]:
                 number={"font": {"size": 72, "color": BRAND_BLUE}},
             )
         )
-        return _apply_layout(fig, title)
+        return _apply_layout(fig, title), None, None
 
     # ── Auto-correct chart type based on data shape ──
     chart_type = _auto_correct_chart_type(df, x_col, y_col, chart_type)
 
     # ── Dispatch ──
+    warning_msg = None
     try:
-        if chart_type == "pie":
+        if chart_type == "map":
+            fig, map_warn = _map(df, cfg)
+            if map_warn:
+                warning_msg = map_warn
+            if fig is None:
+                raise ValueError("Insufficient data or geocoding failed.")
+        elif chart_type == "pie":
             fig = _pie(df, x_col, y_col)
         elif chart_type == "line":
             fig = _line(df, x_col, y_col, color_col, cfg)
@@ -166,33 +279,31 @@ def build_chart(df: pd.DataFrame, cfg: Dict) -> Optional[go.Figure]:
         else:
             fig = _bar(df, x_col, y_col, color_col, cfg)
 
-        return _apply_layout(fig, title)
+        return _apply_layout(fig, title), None, warning_msg
 
-    except Exception:
-        # Last-resort fallback: simple horizontal bar of first two columns
+    except Exception as e:
+        err_msg = (
+            f"❌ **Visual Rendering Error:** Could not build the requested {chart_type.title()} chart.\n\n"
+            f"💡 **What to do:** The shape of the data returned by the AI might not match the strict requirements "
+            f"for a {chart_type.title()}. I have automatically generated a fallback Bar Chart so you can still view the data."
+        )
+        # Last-resort fallback: simple horizontal bar
         try:
             fig = px.bar(df, x=y_col, y=x_col, orientation="h",
                          color_discrete_sequence=PALETTE)
-            return _apply_layout(fig, title)
+            return _apply_layout(fig, title), err_msg, warning_msg
         except Exception:
-            return None
+            return None, err_msg, warning_msg
 
 
 # ─────────────────────────────────────────────────────────
 # 3. HOVER-DETAIL HELPERS
 # ─────────────────────────────────────────────────────────
-# Every generated chart only reflects the columns the AI's SQL query
-# happened to select for x/y/color. Anything else in that result set —
-# extra metrics, IDs, secondary breakdowns — was previously invisible on
-# hover. These helpers surface the FULL row of underlying data whenever
-# the user hovers over a bar, point, or slice, instead of just x & y.
 
 def _dynamic_hover_data(df: pd.DataFrame, shown_cols) -> Dict:
     """
     Builds a plotly-express `hover_data` dict that includes every column
-    in the result set NOT already shown elsewhere (axes / hover_name),
-    with numeric columns formatted using thousands separators so the
-    hover card reads like a clean mini data-card rather than raw numbers.
+    in the result set NOT already shown elsewhere.
     """
     hover_data: Dict = {}
     for col in df.columns:
@@ -208,8 +319,7 @@ def _dynamic_hover_data(df: pd.DataFrame, shown_cols) -> Dict:
 def _hover_kwargs(df: pd.DataFrame, primary_col: str, *other_shown_cols: str) -> Dict:
     """
     Convenience wrapper: returns {"hover_name": ..., "hover_data": ...}
-    ready to splice into a plotly.express call so hovering over any chart
-    element reveals the full underlying data for that point/bar/slice.
+    ready to splice into a plotly.express call.
     """
     shown = {primary_col, *other_shown_cols}
     hover_data = _dynamic_hover_data(df, shown)
@@ -221,8 +331,166 @@ def _hover_kwargs(df: pd.DataFrame, primary_col: str, *other_shown_cols: str) ->
 # 4. INDIVIDUAL CHART BUILDERS
 # ─────────────────────────────────────────────────────────
 
+def _map(df: pd.DataFrame, cfg: Dict) -> Tuple[Optional[go.Figure], Optional[str]]:
+    """Builds a geospatial map, handling both coordinates and text locations with graceful degradation.
+    Returns (Figure, warning_message)."""
+    lat_col = cfg.get("lat_column")
+    lon_col = cfg.get("lon_column")
+    loc_col = cfg.get("location_column")
+    color_col = cfg.get("color_column") if cfg.get("color_column") in df.columns else None
+    size_col = cfg.get("size_column") if cfg.get("size_column") in df.columns else None
+
+    # ── Scenario A: Exact Coordinates are provided ──
+    if lat_col in df.columns and lon_col in df.columns:
+        # Dynamic zoom and center
+        center_lat = df[lat_col].mean()
+        center_lon = df[lon_col].mean()
+        lat_range = df[lat_col].max() - df[lat_col].min()
+        lon_range = df[lon_col].max() - df[lon_col].min()
+        max_range = max(lat_range, lon_range)
+        
+        if max_range == 0: zoom = 6
+        elif max_range > 15: zoom = 4
+        elif max_range > 8: zoom = 5
+        elif max_range > 4: zoom = 6
+        elif max_range > 2: zoom = 7
+        elif max_range > 1: zoom = 8
+        elif max_range > 0.5: zoom = 9
+        elif max_range > 0.2: zoom = 10
+        elif max_range > 0.1: zoom = 11
+        elif max_range > 0.05: zoom = 12
+        else: zoom = 13
+
+        hover_kwargs = _hover_kwargs(df, loc_col or lat_col, lat_col, lon_col)
+        fig = px.scatter_mapbox(
+            df, lat=lat_col, lon=lon_col, color=color_col, size=size_col,
+            color_discrete_sequence=PALETTE, mapbox_style="white-bg", 
+            zoom=zoom, center={"lat": center_lat, "lon": center_lon},
+            **hover_kwargs
+        )
+        fig.update_layout(
+            mapbox_layers=[
+                {
+                    "below": 'traces',
+                    "sourcetype": "raster",
+                    "sourceattribution": "Google Maps Satellite",
+                    "source": ["https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"]
+                }
+            ],
+            margin={"r":0,"t":0,"l":0,"b":0},
+            hovermode="closest"
+        )
+        return fig, None
+
+    if loc_col in df.columns:
+        unique_locs = df[loc_col].dropna().unique().tolist()
+        
+        coords_map, failed = geocode_locations(unique_locs)
+        
+        warning_msg = None
+        if failed:
+            warning_msg = (
+                f"⚠️ **Mapping Notice:** Could not find exact map coordinates for {len(failed)} location(s) "
+                f"(e.g., {', '.join(map(str, failed[:3]))}). They are excluded from this map.\n\n"
+                "💡 **What to do:** Ensure village/city names are spelled correctly in your dataset."
+            )
+        
+        plot_df = df.copy()
+        plot_df['__lat__'] = plot_df[loc_col].map(lambda x: coords_map.get(x, (None, None))[0])
+        plot_df['__lon__'] = plot_df[loc_col].map(lambda x: coords_map.get(x, (None, None))[1])
+        plot_df = plot_df.dropna(subset=['__lat__', '__lon__'])
+        
+        # Actionable Error for total failure
+        if plot_df.empty:
+            return None, "❌ **Mapping Failed:** None of the locations could be found on the map."
+        
+        hover_kwargs = _hover_kwargs(plot_df, loc_col, '__lat__', '__lon__')
+        # Hide the secret translation columns from the user's hover tooltip
+        hover_kwargs["hover_data"]["__lat__"] = False
+        hover_kwargs["hover_data"]["__lon__"] = False
+
+        # Dynamic zoom and center
+        center_lat = plot_df['__lat__'].mean()
+        center_lon = plot_df['__lon__'].mean()
+        lat_range = plot_df['__lat__'].max() - plot_df['__lat__'].min()
+        lon_range = plot_df['__lon__'].max() - plot_df['__lon__'].min()
+        max_range = max(lat_range, lon_range)
+        if max_range == 0: zoom = 6  # Single point (e.g. 1 state/city), show regional context
+        elif max_range > 15: zoom = 4
+        elif max_range > 8: zoom = 5
+        elif max_range > 4: zoom = 6
+        elif max_range > 2: zoom = 7
+        elif max_range > 1: zoom = 8
+        elif max_range > 0.5: zoom = 9
+        elif max_range > 0.2: zoom = 10
+        elif max_range > 0.1: zoom = 11
+        elif max_range > 0.05: zoom = 12
+        else: zoom = 13
+
+        geojson_path = "districts_aot.geojson"
+        geojson_data = None
+        if os.path.exists(geojson_path):
+            try:
+                with open(geojson_path, "r", encoding="utf-8") as f:
+                    geojson_data = json.load(f)
+            except Exception:
+                pass
+
+        if geojson_data:
+            # Capitalize locations to match GeoJSON properties (usually title case)
+            plot_df['__match_loc__'] = plot_df[loc_col].astype(str).str.title()
+            
+            # Verify if ANY locations actually match the GeoJSON features
+            valid_features = {f.get('properties', {}).get('NAME_2', '').title() for f in geojson_data.get('features', [])}
+            match_count = plot_df['__match_loc__'].isin(valid_features).sum()
+
+            if match_count > 0:
+                # Override hover kwargs for choropleth
+                hover_kwargs = _hover_kwargs(plot_df, loc_col)
+                
+                fig = px.choropleth_mapbox(
+                    plot_df,
+                    geojson=geojson_data,
+                    locations='__match_loc__',
+                    featureidkey="properties.NAME_2",
+                    color=color_col if color_col else loc_col,
+                    color_discrete_sequence=PALETTE,
+                    mapbox_style="white-bg",
+                    zoom=zoom,
+                    center={"lat": center_lat, "lon": center_lon},
+                    opacity=0.6,
+                    **hover_kwargs
+                )
+            else:
+                # Fallback to scatter map if the dataset locations (e.g. States) don't match our District GeoJSON
+                geojson_data = None
+
+        if not geojson_data:
+            fig = px.scatter_mapbox(
+                plot_df, lat='__lat__', lon='__lon__', color=color_col, size=size_col,
+                color_discrete_sequence=PALETTE, mapbox_style="white-bg", zoom=zoom,
+                center={"lat": center_lat, "lon": center_lon},
+                **hover_kwargs
+            )
+            
+        fig.update_layout(
+            mapbox_layers=[
+                {
+                    "below": 'traces',
+                    "sourcetype": "raster",
+                    "sourceattribution": "Google Maps Satellite",
+                    "source": ["https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"]
+                }
+            ],
+            margin={"r":0,"t":0,"l":0,"b":0},
+            hovermode="closest"
+        )
+        return fig, warning_msg
+    
+    return None, None
+
+
 def _bar(df, x_col, y_col, color_col, cfg) -> go.Figure:
-    # 🟢 Find the best category column to use as the bold hover title
     hover_cat = color_col if color_col else x_col
     hover_kwargs = _hover_kwargs(df, hover_cat, x_col, y_col)
 
@@ -248,6 +516,7 @@ def _bar(df, x_col, y_col, color_col, cfg) -> go.Figure:
         bargap=0.25,
         uniformtext_minsize=8,
         uniformtext_mode="hide",
+        hovermode="closest",
     )
     return fig
 
@@ -276,8 +545,6 @@ def _pie(df, x_col, y_col) -> go.Figure:
         textinfo="percent+label",
         insidetextorientation="radial",
         pull=[0.03] * len(df),
-        # Native Plotly hover already appends value + percent automatically;
-        # combined with hover_data above, the card now shows every extra field too.
     )
     return fig
 
@@ -321,7 +588,7 @@ def _histogram(df, x_col) -> go.Figure:
     return px.histogram(
         df, x=x_col,
         nbins=min(40, df[x_col].nunique()),
-        color=x_col if df[x_col].nunique() < 20 else None,  # add colors if there aren't too many bars
+        color=x_col if df[x_col].nunique() < 20 else None,
         color_discrete_sequence=PALETTE,
         labels={x_col: _prettify(x_col)},
         **hover_kwargs,
@@ -333,7 +600,7 @@ def _treemap(df, x_col, y_col) -> go.Figure:
         hover_kwargs = _hover_kwargs(df, x_col, y_col)
         return px.treemap(
             df, path=[x_col], values=y_col,
-            color=x_col,  # forces the treemap to use the custom palette
+            color=x_col, 
             color_discrete_sequence=PALETTE,
             **hover_kwargs,
         )
@@ -353,7 +620,7 @@ def _funnel(df, x_col, y_col) -> go.Figure:
         hover_kwargs = _hover_kwargs(df, x_col, y_col)
         return px.funnel(
             df, y=x_col, x=y_col,
-            color=x_col,  # distinct colors per funnel stage
+            color=x_col,
             color_discrete_sequence=PALETTE,
             **hover_kwargs,
         )
@@ -393,10 +660,6 @@ def _auto_correct_chart_type(
 ) -> str:
     """
     Overrides a requested chart type if it would produce a broken/ugly result.
-    Rules:
-      - pie  → switch to bar if more than 10 categories
-      - line → switch to bar if X axis is not ordered/sequential
-      - histogram → keep only if x_col is numeric
     """
     n_cats = df[x_col].nunique() if x_col in df.columns else 0
 
@@ -441,7 +704,6 @@ def _apply_layout(fig: go.Figure, title: str) -> go.Figure:
             "borderwidth": 1,
             "font": {"size": 11},
         },
-        # Styling the Hover Tooltip to look professional and readable
         hoverlabel=dict(
             bgcolor="white",
             font_size=13,
@@ -452,7 +714,6 @@ def _apply_layout(fig: go.Figure, title: str) -> go.Figure:
         ),
         hovermode="closest",
     )
-    # Subtle grid lines on axes where applicable
     for axis in ("xaxis", "yaxis"):
         if hasattr(fig.layout, axis):
             getattr(fig.layout, axis).update(
@@ -460,6 +721,8 @@ def _apply_layout(fig: go.Figure, title: str) -> go.Figure:
                 zerolinecolor="rgba(200,200,200,0.5)",
             )
     return fig
+
+
 # ─────────────────────────────────────────────────────────
 # 6. SIDEBAR SETTINGS (ACCESSIBILITY FOCUSED)
 # ─────────────────────────────────────────────────────────
@@ -469,7 +732,6 @@ def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("### ⚙️ View Settings")
 
-        # 1. Font Size Toggle
         text_size = st.radio(
             "🔠 Text Size",
             ["Normal", "Large"],
@@ -477,26 +739,20 @@ def render_sidebar() -> None:
             key="sidebar_text_size_toggle"
         )
 
-        # 2. High Contrast Toggle (Perfect for outdoor visibility)
         high_contrast = st.toggle(
             "🌗 High Contrast Mode",
             value=False,
             key="sidebar_contrast_toggle"
         )
 
-        # The confusing theme message has been removed from here!
-
-    # ── DYNAMIC STYLING LOGIC ──
     custom_css = ""
 
-    # Apply Large Text CSS
     if text_size == "Large":
         custom_css += """
         html, body, [class*="css"] { font-size: 1.2rem !important; }
         .stDataFrame { font-size: 1.1rem !important; }
         """
 
-    # Apply High Contrast CSS
     if high_contrast:
         custom_css += """
         /* 1. Force Pure White Backgrounds */
@@ -555,53 +811,56 @@ def render_sidebar() -> None:
         }
         """
 
-    # Inject the CSS into the app
     if custom_css:
         st.markdown(f"<style>{custom_css}</style>", unsafe_allow_html=True)
+
 
 # ─────────────────────────────────────────────────────────
 # 7. CUSTOM ANIMATED LOADER (PURE CONTRAST)
 # ─────────────────────────────────────────────────────────
 
 @contextlib.contextmanager
-def farm_loader():
+def farm_loader(text=""):
     """
     Phase 1 & 2: Full-screen blocking overlay loader.
-    UX UPGRADE: Highly transparent with a soft background blur so the user can see the app working.
     """
     placeholder = st.empty()
-    html_code = """
+    html_code = f"""
     <style>
-    .full-screen-loader {
+    .full-screen-loader {{
         position: fixed;
         top: 0; left: 0; width: 100vw; height: 100vh;
         z-index: 999999;
-        display: flex; justify-content: center; align-items: center;
-        gap: 20px; font-size: 3.5rem;
+        display: flex; flex-direction: column; justify-content: center; align-items: center;
+        gap: 12px;
         
-        /* 👇 Transparent Frosted Glass Effect for Full Screen 👇 */
-        background-color: rgba(248, 251, 248, 0.35); /* 65% transparent! */
-        backdrop-filter: blur(4px); /* Gently blurs the app behind it */
-    }
-    .farm-emoji-full {
-        filter: drop-shadow(0px 4px 8px rgba(0, 0, 0, 0.4));
+        /* Clean Professional Frosted Glass Effect */
+        background-color: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(8px);
+    }}
+    .farm-emoji-full {{
+        font-size: 2.5rem;
+        filter: drop-shadow(0px 4px 8px rgba(0, 0, 0, 0.15));
         animation: full-bounce 1.2s infinite ease-in-out both;
-    }
-    .farm-emoji-full:nth-child(1) { animation-delay: -0.6s; }
-    .farm-emoji-full:nth-child(2) { animation-delay: -0.4s; }
-    .farm-emoji-full:nth-child(3) { animation-delay: -0.2s; }
-    .farm-emoji-full:nth-child(4) { animation-delay: 0s; }
+    }}
+    .farm-emoji-full:nth-child(1) {{ animation-delay: -0.6s; }}
+    .farm-emoji-full:nth-child(2) {{ animation-delay: -0.4s; }}
+    .farm-emoji-full:nth-child(3) {{ animation-delay: -0.2s; }}
+    .farm-emoji-full:nth-child(4) {{ animation-delay: 0s; }}
 
-    @keyframes full-bounce {
-        0%, 80%, 100% { transform: translateY(0) scale(0.8); opacity: 0.5; }
-        40% { transform: translateY(-25px) scale(1.2); opacity: 1; }
-    }
+    @keyframes full-bounce {{
+        0%, 80%, 100% {{ transform: translateY(0) scale(0.9); opacity: 0.8; }}
+        40% {{ transform: translateY(-12px) scale(1.1); opacity: 1; }}
+    }}
     </style>
     <div class="full-screen-loader">
-        <div class="farm-emoji-full">🌾</div>
-        <div class="farm-emoji-full">🤖</div>
-        <div class="farm-emoji-full">📊</div>
-        <div class="farm-emoji-full">🍃</div>
+        <div style="display: flex; gap: 12px;">
+            <div class="farm-emoji-full">🌾</div>
+            <div class="farm-emoji-full">🤖</div>
+            <div class="farm-emoji-full">📊</div>
+            <div class="farm-emoji-full">🍃</div>
+        </div>
+        {f'<div style="font-size: 0.95rem; margin-top: 10px; font-weight: 500; color: #4b5563; text-align: center; white-space: pre-wrap; font-family: sans-serif;">{text}</div>' if text else ''}
     </div>
     """
     placeholder.markdown(html_code, unsafe_allow_html=True)
@@ -612,41 +871,69 @@ def farm_loader():
 
 
 @contextlib.contextmanager
-def inline_farm_loader():
+def inline_farm_loader(text="AI is analysing your data and building the chart...", auto_scroll_down=False):
     """
-    Phase 3: Smooth inline non-blocking loader.
-    Reverted to the clean, invisible background style.
+    Phase 3: Smooth inline non-blocking loader shown while AI generates chart.
     """
     placeholder = st.empty()
-    html_code = """
+    if auto_scroll_down:
+        import time
+        ts = int(time.time() * 1000)
+        st.components.v1.html(
+            f"""
+            <script>
+            setTimeout(function() {{
+                const targets = [
+                    window.parent.document.querySelector('[data-testid="stAppViewContainer"]'),
+                    window.parent.document.querySelector('.main'),
+                    window.parent.document.documentElement,
+                    window.parent.document.body
+                ];
+                targets.forEach(t => {{ if (t) {{ t.scrollBy({{top: 500, behavior: 'smooth'}}); }} }});
+            }}, 50);
+            </script>
+            """, height=0
+        )
+        
+    html_code = f"""
     <style>
-    .inline-loader {
+    .inline-loader {{
         display: flex;
+        flex-direction: column;
         justify-content: center;
         align-items: center;
-        gap: 15px;
-        font-size: 2rem;
-        padding: 30px 0px;
-    }
-    .farm-emoji-inline {
+        gap: 8px;
+        padding: 15px 0px;
+    }}
+    .inline-loader-row {{
+        display: flex;
+        gap: 10px;
+        font-size: 1.5rem;
+    }}
+    .farm-emoji-inline {{
         filter: drop-shadow(0px 2px 4px rgba(0, 0, 0, 0.2));
         animation: inline-bounce 1.2s infinite ease-in-out both;
-    }
-    .farm-emoji-inline:nth-child(1) { animation-delay: -0.6s; }
-    .farm-emoji-inline:nth-child(2) { animation-delay: -0.4s; }
-    .farm-emoji-inline:nth-child(3) { animation-delay: -0.2s; }
-    .farm-emoji-inline:nth-child(4) { animation-delay: 0s; }
+    }}
+    .farm-emoji-inline:nth-child(1) {{ animation-delay: -0.6s; }}
+    .farm-emoji-inline:nth-child(2) {{ animation-delay: -0.4s; }}
+    .farm-emoji-inline:nth-child(3) {{ animation-delay: -0.2s; }}
+    .farm-emoji-inline:nth-child(4) {{ animation-delay: 0s; }}
 
-    @keyframes inline-bounce {
-        0%, 80%, 100% { transform: translateY(0) scale(0.85); opacity: 0.6; }
-        40% { transform: translateY(-12px) scale(1.1); opacity: 1; }
-    }
+    @keyframes inline-bounce {{
+        0%, 80%, 100% {{ transform: translateY(0) scale(0.9); opacity: 0.7; }}
+        40% {{ transform: translateY(-8px) scale(1.15); opacity: 1; }}
+    }}
     </style>
-    <div class="inline-loader">
-        <div class="farm-emoji-inline">🌾</div>
-        <div class="farm-emoji-inline">🤖</div>
-        <div class="farm-emoji-inline">📊</div>
-        <div class="farm-emoji-inline">🍃</div>
+    <div class="inline-loader" id="active_farm_loader">
+        <div class="inline-loader-row">
+            <div class="farm-emoji-inline">&#127806;</div>
+            <div class="farm-emoji-inline">&#129302;</div>
+            <div class="farm-emoji-inline">&#128202;</div>
+            <div class="farm-emoji-inline">&#127811;</div>
+        </div>
+        <div style="font-size: 0.95rem; font-weight: 500; color: #6b7280; font-family: sans-serif; margin-top: 5px;">
+            {text}
+        </div>
     </div>
     """
     placeholder.markdown(html_code, unsafe_allow_html=True)
